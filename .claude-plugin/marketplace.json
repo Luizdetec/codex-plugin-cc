@@ -1,19 +1,19 @@
 {
-  "name": "openai-codex",
+  "name": "vanguardia-codex",
   "owner": {
-    "name": "OpenAI"
+    "name": "VanguardIA"
   },
   "metadata": {
     "description": "Codex plugins to use in Claude Code for delegation and code review.",
-    "version": "1.0.6"
+    "version": "1.1.0-astra.1"
   },
   "plugins": [
     {
       "name": "codex",
       "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.0.6",
+      "version": "1.1.0-astra.1",
       "author": {
-        "name": "OpenAI"
+        "name": "VanguardIA (fork of OpenAI)"
       },
       "source": "./plugins/codex"
     }

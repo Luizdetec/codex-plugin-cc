@@ -40,9 +40,10 @@ import os from "node:os";
 import path from "node:path";
 
 import { readJsonFile } from "./fs.mjs";
-import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
+import { BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
+import { listAvailableModels, resolveTaskModel } from "./models.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
@@ -558,6 +559,7 @@ function applyTurnNotification(state, message) {
 
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
+  state.completion.catch(() => {});
   const previousHandler = client.notificationHandler;
 
   client.setNotificationHandler((message) => {
@@ -603,7 +605,10 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    return await Promise.race([
+      state.completion,
+      client.exitPromise.then(() => { throw client.exitError ?? new Error("Codex disconnected before the turn completed."); })
+    ]);
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
@@ -611,33 +616,12 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 }
 
 async function withAppServer(cwd, fn) {
-  let client = null;
+  const client = await CodexAppServerClient.connect(cwd);
   try {
-    client = await CodexAppServerClient.connect(cwd);
-    const result = await fn(client);
+    return await fn(client);
+  } finally {
+    // Never replay a possibly accepted mutation against a fresh server.
     await client.close();
-    return result;
-  } catch (error) {
-    const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
-    const shouldRetryDirect =
-      (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
-
-    if (client) {
-      await client.close().catch(() => {});
-      client = null;
-    }
-
-    if (!shouldRetryDirect) {
-      throw error;
-    }
-
-    const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
-    try {
-      return await fn(directClient);
-    } finally {
-      await directClient.close();
-    }
   }
 }
 
@@ -999,6 +983,22 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
   }
 }
 
+export async function getAvailableModels(cwd) {
+  return withDirectAppServer(cwd, listAvailableModels);
+}
+
+export async function steerAppServerTurn(cwd, { threadId, turnId, prompt }) {
+  if (!threadId || !turnId) throw new Error("Job has no active Codex turn yet. Check /codex:status and retry.");
+  const broker = loadBrokerSession(cwd);
+  if (!broker?.endpoint) throw new Error("Steering requires the job's live shared broker; no new server was started.");
+  const client = await CodexAppServerClient.connect(cwd, { brokerEndpoint: broker.endpoint });
+  try {
+    return await client.request("turn/steer", { threadId, expectedTurnId: turnId, input: buildTurnInput(prompt) });
+  } finally {
+    await client.close();
+  }
+}
+
 export async function runAppServerReview(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -1099,6 +1099,10 @@ export async function runAppServerTurn(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
+    const selection = options.validateModel
+      ? await resolveTaskModel(client, options.model, options.effort)
+      : { model: options.model, effort: options.effort };
+    options = { ...options, ...selection };
     let threadId;
 
     if (options.resumeThreadId) {
@@ -1154,6 +1158,8 @@ export async function runAppServerTurn(cwd, options = {}) {
       stderr: cleanCodexStderr(client.stderr),
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
+      model: selection.model,
+      effort: selection.effort,
       commandExecutions: turnState.commandExecutions
     };
   });

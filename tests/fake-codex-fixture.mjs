@@ -272,9 +272,14 @@ if (args[0] !== "app-server") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+bootState.appServerPid = process.pid;
 saveState(bootState);
 
 const rl = readline.createInterface({ input: process.stdin });
+if (BEHAVIOR === "ignore-shutdown") {
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1000);
+}
 rl.on("line", (line) => {
   if (!line.trim()) {
     return;
@@ -286,6 +291,7 @@ rl.on("line", (line) => {
   try {
     switch (message.method) {
       case "initialize":
+        if (BEHAVIOR === "hang-initialize") break;
         state.capabilities = message.params.capabilities || null;
         saveState(state);
         send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
@@ -293,6 +299,21 @@ rl.on("line", (line) => {
 
       case "initialized":
         break;
+
+      case "model/list": {
+        const names = BEHAVIOR === "no-astra" ? ["gpt-5.3-codex-spark"] : ["gpt-6-astra", "gpt-5.3-codex-spark"];
+        send({ id: message.id, result: { data: names.map(model => ({ id: model, model, defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map(reasoningEffort => ({ reasoningEffort })) })), nextCursor: null } });
+        break;
+      }
+
+      case "turn/steer": {
+        const pending = interruptibleTurns.get(message.params.expectedTurnId);
+        if (!pending || pending.threadId !== message.params.threadId) throw new Error("No matching active turn");
+        state.lastSteer = message.params;
+        saveState(state);
+        send({ id: message.id, result: { turnId: message.params.expectedTurnId } });
+        break;
+      }
 
       case "account/read":
         send({ id: message.id, result: buildAccountReadResult() });
@@ -585,7 +606,9 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        if (BEHAVIOR === "crash-task") {
+            setTimeout(() => process.exit(1), 30);
+          } else if (BEHAVIOR === "interruptible-slow-task") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {

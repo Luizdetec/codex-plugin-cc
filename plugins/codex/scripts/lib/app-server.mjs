@@ -92,8 +92,18 @@ class AppServerClientBase {
     this.nextId += 1;
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
-      this.sendMessage({ id, method, params });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`codex app-server ${method} timed out.`));
+      }, this.options.requestTimeoutMs ?? 30000);
+      this.pending.set(id, { resolve, reject, method, timer });
+      try {
+        this.sendMessage({ id, method, params });
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error);
+      }
     });
   }
 
@@ -139,6 +149,7 @@ class AppServerClientBase {
         return;
       }
       this.pending.delete(message.id);
+      clearTimeout(pending.timer);
 
       if (message.error) {
         pending.reject(createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error));
@@ -169,6 +180,7 @@ class AppServerClientBase {
     this.exitError = error ?? null;
 
     for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
       pending.reject(this.exitError ?? new Error("codex app-server connection closed."));
     }
     this.pending.clear();
@@ -196,6 +208,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     });
 
     this.proc.stdout.setEncoding("utf8");
+    this.proc.stdin.on("error", (error) => this.handleExit(error));
     this.proc.stderr.setEncoding("utf8");
 
     this.proc.stderr.on("data", (chunk) => {
@@ -241,10 +254,10 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.readline.close();
     }
 
-    if (this.proc && !this.proc.killed) {
+    if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
       this.proc.stdin.end();
-      setTimeout(() => {
-        if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
+      const termTimer = setTimeout(() => {
+        if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
           // On Windows with shell: true, the direct child is cmd.exe.
           // Use terminateProcessTree to kill the entire tree including
           // the grandchild node process.
@@ -259,7 +272,19 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
             this.proc.kill("SIGTERM");
           }
         }
-      }, 50).unref?.();
+      }, 50);
+      const killTimer = setTimeout(() => {
+        if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) this.proc.kill("SIGKILL");
+      }, 1000);
+      try {
+        // Protocol failure is not process exit; wait for the actual child.
+        if (this.proc.exitCode === null && this.proc.signalCode === null) {
+          await new Promise((resolve) => this.proc.once("close", resolve));
+        }
+      } finally {
+        clearTimeout(termTimer);
+        clearTimeout(killTimer);
+      }
     }
 
     await this.exitPromise;
@@ -317,7 +342,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
 
     this.closed = true;
     if (this.socket) {
-      this.socket.end();
+      this.socket.destroy();
     }
     await this.exitPromise;
   }
@@ -348,7 +373,12 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
+    try {
+      await client.initialize();
+    } catch (error) {
+      await client.close().catch(() => {});
+      throw error;
+    }
     return client;
   }
 }

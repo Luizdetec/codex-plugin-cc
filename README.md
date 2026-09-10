@@ -1,4 +1,4 @@
-# Codex plugin for Claude Code
+# Codex Astra — fork for Claude Code
 
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
 
@@ -6,6 +6,30 @@ This plugin is for Claude Code users who want an easy way to start using Codex f
 they already have.
 
 <video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
+
+This is an independent VanguardIA fork of OpenAI's plugin, not an official OpenAI release. License and upstream notices are preserved.
+Do not enable this and the official `codex` plugin together: both intentionally preserve the `/codex:` command namespace. No global configuration changes are required.
+
+## Astra delegation
+
+```text
+/codex:models
+/codex:delegate --background --model astra --effort high implement the scoped task and verify it
+/codex:status
+/codex:steer task-ID focus on the failing test first
+/codex:result task-ID
+/codex:cancel task-ID
+```
+
+`/codex:rescue` remains compatible. Background is managed by the runtime, not nested Claude background agents.
+Explicit continuation resumes the current Claude session's last task without a redundant confirmation.
+Failures remain visible. No silent model fallback or replay of a possibly accepted task occurs.
+
+One active write task per checkout is enforced across sessions. Use separate worktrees for parallel edits.
+After abrupt termination a write lock may remain: verify the task and its Codex processes have exited before removing the exact lock reported by the error.
+Steering requires a running job in the same Claude session and its live broker.
+The broker handles one active task at a time; a busy response is an explicit failure, not a hidden second execution.
+Native reviews keep their original Codex model behavior; the Astra default applies to delegated tasks.
 
 ## What You Get
 
@@ -24,13 +48,13 @@ they already have.
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add Luizdetec/codex-plugin-cc
 ```
 
 Install the plugin:
 
 ```bash
-/plugin install codex@openai-codex
+/plugin install codex@vanguardia-codex
 ```
 
 Reload plugins:
@@ -145,7 +169,7 @@ Examples:
 /codex:rescue investigate why the tests started failing
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
-/codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
+/codex:rescue --model gpt-5.6-luna --effort medium investigate the flaky integration test
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
 ```
@@ -158,7 +182,7 @@ Ask Codex to redesign the database connection to be more resilient.
 
 **Notes:**
 
-- if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
+- if you do not pass `--model`, tasks use `gpt-6-astra`; omitted `--effort` uses that model's advertised default. Both are validated against the current Codex catalog.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
 

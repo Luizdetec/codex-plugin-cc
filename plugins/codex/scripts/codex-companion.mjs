@@ -7,6 +7,8 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { normalizeRequestedModel } from "./lib/models.mjs";
+import { withWorkspaceWriteLock } from "./lib/workspace-lock.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -16,6 +18,8 @@ import {
     getSessionRuntimeStatus,
     importExternalAgentSession,
     interruptAppServerTurn,
+    steerAppServerTurn,
+    getAvailableModels,
     parseStructuredOutput,
     readOutputSchema,
     runAppServerReview,
@@ -68,8 +72,6 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
-const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
-const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
@@ -79,11 +81,13 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background|--wait] [--write] [--resume-last|--resume|--fresh] [--model <model|astra|spark>] [--effort <effort>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
+      "  node scripts/codex-companion.mjs models [--json]",
+      "  node scripts/codex-companion.mjs steer <job-id> <instructions>"
     ].join("\n")
   );
 }
@@ -100,17 +104,6 @@ function outputCommandResult(payload, rendered, asJson) {
   outputResult(asJson ? payload : rendered, asJson);
 }
 
-function normalizeRequestedModel(model) {
-  if (model == null) {
-    return null;
-  }
-  const normalized = String(model).trim();
-  if (!normalized) {
-    return null;
-  }
-  return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
-}
-
 function normalizeReasoningEffort(effort) {
   if (effort == null) {
     return null;
@@ -118,11 +111,6 @@ function normalizeReasoningEffort(effort) {
   const normalized = String(effort).trim().toLowerCase();
   if (!normalized) {
     return null;
-  }
-  if (!VALID_REASONING_EFFORTS.has(normalized)) {
-    throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh.`
-    );
   }
   return normalized;
 }
@@ -482,17 +470,18 @@ async function executeTaskRun(request) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
 
-  const result = await runAppServerTurn(workspaceRoot, {
+  const result = await withWorkspaceWriteLock(workspaceRoot, request.write, () => runAppServerTurn(workspaceRoot, {
     resumeThreadId,
     prompt: request.prompt,
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
+    validateModel: true,
     sandbox: request.write ? "workspace-write" : "read-only",
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
-  });
+  }));
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
   const failureMessage = result.error?.message ?? result.stderr ?? "";
@@ -511,6 +500,8 @@ async function executeTaskRun(request) {
   const payload = {
     status: result.status,
     threadId: result.threadId,
+    model: result.model,
+    effort: result.effort,
     rawOutput,
     touchedFiles: result.touchedFiles,
     reasoningSummary: result.reasoningSummary
@@ -762,7 +753,7 @@ async function handleReview(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "wait"],
     aliasMap: {
       m: "model"
     }
@@ -773,6 +764,7 @@ async function handleTask(argv) {
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
   const prompt = readTaskPrompt(cwd, options, positionals);
+  if (options.wait && options.background) throw new Error("Choose either --wait or --background.");
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
@@ -960,6 +952,24 @@ function handleTaskResumeCandidate(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
+async function handleModels(argv) {
+  const { options } = parseCommandInput(argv, { valueOptions: ["cwd"], booleanOptions: ["json"] });
+  const models = await getAvailableModels(resolveCommandCwd(options));
+  outputResult(options.json ? models : models.map((m) => `${m.model}: ${m.supportedReasoningEfforts.map((e) => e.reasoningEffort).join(", ")} (default: ${m.defaultReasoningEffort})`).join("\n") + "\n", options.json);
+}
+
+async function handleSteer(argv) {
+  const { options, positionals } = parseCommandInput(argv, { valueOptions: ["cwd"], booleanOptions: ["json"] });
+  const [reference, ...words] = positionals;
+  if (!reference || !words.length) throw new Error("Usage: steer <job-id> <additional instructions>");
+  const cwd = resolveCommandCwd(options);
+  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
+  if (job.sessionId !== (process.env[SESSION_ID_ENV] ?? null)) throw new Error("Cannot steer a job from another Claude session.");
+  const stored = readStoredJob(workspaceRoot, job.id) ?? job;
+  const result = await steerAppServerTurn(cwd, { threadId: stored.threadId, turnId: stored.turnId, prompt: words.join(" ") });
+  outputCommandResult({ jobId: job.id, ...result }, `Instructions accepted for ${job.id} (${result.turnId}).\n`, options.json);
+}
+
 async function handleCancel(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
@@ -983,6 +993,14 @@ async function handleCancel(argv) {
     );
   }
 
+  // Let the interrupted worker persist its result and release its write lock first.
+  if (interrupt.interrupted && job.pid) {
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      try { process.kill(job.pid, 0); } catch { break; }
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  }
   terminateProcessTree(job.pid ?? Number.NaN);
   appendLogLine(job.logFile, "Cancelled by user.");
 
@@ -1041,6 +1059,7 @@ async function main() {
       });
       break;
     case "task":
+    case "delegate":
       await handleTask(argv);
       break;
     case "transfer":
@@ -1060,6 +1079,12 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "models":
+      await handleModels(argv);
+      break;
+    case "steer":
+      await handleSteer(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);

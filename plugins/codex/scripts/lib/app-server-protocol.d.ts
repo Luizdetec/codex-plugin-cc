@@ -28,6 +28,7 @@ import type {
   TurnStartResponse,
   UserInput
 } from "../../.generated/app-server-types/v2/index.js";
+import type { ModelListParams, ModelListResponse, TurnSteerParams, TurnSteerResponse } from "../../.generated/app-server-types/v2/index.js";
 
 export type {
   ClientInfo,
@@ -54,10 +55,13 @@ export interface CodexAppServerClientOptions {
   brokerEndpoint?: string;
   disableBroker?: boolean;
   reuseExistingBroker?: boolean;
+  requestTimeoutMs?: number;
 }
 
 export interface AppServerMethodMap {
   initialize: { params: InitializeParams; result: InitializeResponse };
+  "model/list": { params: ModelListParams; result: ModelListResponse };
+  "turn/steer": { params: TurnSteerParams; result: TurnSteerResponse };
   "externalAgentConfig/import": { params: ExternalAgentConfigImportParams; result: ExternalAgentConfigImportResponse };
   "thread/start": { params: ThreadStartParams; result: ThreadStartResponse };
   "thread/resume": { params: ThreadResumeParams; result: ThreadResumeResponse };

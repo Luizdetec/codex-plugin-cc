@@ -3,6 +3,22 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { after } from "node:test";
+import { loadBrokerSession, sendBrokerShutdown } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+
+const brokerWorkspaces = new Set();
+after(async () => {
+  const sessions = [...brokerWorkspaces].map(cwd => loadBrokerSession(cwd)).filter(Boolean);
+  await Promise.all(sessions.map(async session => {
+    await sendBrokerShutdown(session.endpoint);
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      try { process.kill(session.pid, 0); } catch { return; }
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    throw new Error(`Test broker ${session.pid} did not exit after shutdown.`);
+  }));
+});
 
 export function makeTempDir(prefix = "codex-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -13,11 +29,13 @@ export function writeExecutable(filePath, source) {
 }
 
 export function run(command, args, options = {}) {
+  if (options.cwd && args.some(arg => String(arg).includes("codex-companion.mjs"))) brokerWorkspaces.add(options.cwd);
   return spawnSync(command, args, {
     cwd: options.cwd,
     env: options.env,
     encoding: "utf8",
     input: options.input,
+    timeout: options.timeout ?? 30000,
     shell: options.shell ?? (process.platform === "win32" && !path.isAbsolute(command)),
     windowsHide: true
   });

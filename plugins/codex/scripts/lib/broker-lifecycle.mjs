@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { resolveStateDir } from "./state.mjs";
+import { terminateProcessTree } from "./process.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
@@ -26,6 +27,7 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   while (Date.now() - start < timeoutMs) {
     const ready = await new Promise((resolve) => {
       const socket = connectToEndpoint(endpoint);
+      socket.setTimeout(150, () => { socket.destroy(); resolve(false); });
       socket.on("connect", () => {
         socket.end();
         resolve(true);
@@ -43,6 +45,7 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
 export async function sendBrokerShutdown(endpoint) {
   await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
+    socket.setTimeout(2000, () => { socket.destroy(); resolve(); });
     socket.setEncoding("utf8");
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
@@ -111,6 +114,25 @@ async function isBrokerEndpointReady(endpoint) {
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
+  const directory = resolveStateDir(cwd);
+  fs.mkdirSync(directory, { recursive: true });
+  const lock = path.join(directory, "broker-start.lock");
+  const deadline = Date.now() + 15000;
+  while (true) {
+    try { fs.mkdirSync(lock); break; } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      if (Date.now() >= deadline) throw new Error(`Broker startup is locked. Check for a crashed launcher before removing ${lock}`);
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  }
+  try {
+    return await startOrReuseBroker(cwd, options);
+  } finally {
+    fs.rmdirSync(lock);
+  }
+}
+
+async function startOrReuseBroker(cwd, options = {}) {
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;
@@ -146,8 +168,14 @@ export async function ensureBrokerSession(cwd, options = {}) {
     env: options.env ?? process.env
   });
 
-  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
+  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 12000);
   if (!ready) {
+    // The child was spawned detached by this call, so its process group is ours.
+    if (process.platform !== "win32") {
+      try { process.kill(-child.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+    } else {
+      terminateProcessTree(child.pid);
+    }
     teardownBrokerSession({
       endpoint,
       pidFile,
@@ -156,7 +184,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
       pid: child.pid ?? null,
       killProcess: options.killProcess ?? null
     });
-    return null;
+    throw new Error("Codex broker did not become ready. Check the installed Codex runtime and retry.");
   }
 
   const session = {

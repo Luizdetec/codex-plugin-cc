@@ -82,6 +82,14 @@ function handleSessionStart(input) {
 
 async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
+  const sessionId = input.session_id || process.env[SESSION_ID_ENV];
+  const jobs = loadState(resolveWorkspaceRoot(cwd)).jobs;
+  const otherSessionActive = jobs.some(job => job.sessionId !== sessionId && (job.status === "queued" || job.status === "running"));
+  if (otherSessionActive) {
+    // The broker is shared by checkout, not owned by the session ending here.
+    cleanupSessionJobs(cwd, sessionId);
+    return;
+  }
   const brokerSession =
     loadBrokerSession(cwd) ??
     (process.env[BROKER_ENDPOINT_ENV]
@@ -99,9 +107,14 @@ async function handleSessionEnd(input) {
 
   if (brokerEndpoint) {
     await sendBrokerShutdown(brokerEndpoint);
+    const deadline = Date.now() + 1500;
+    while (pid && Date.now() < deadline) {
+      try { process.kill(pid, 0); } catch { break; }
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
   }
 
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
+  cleanupSessionJobs(cwd, sessionId);
   teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,

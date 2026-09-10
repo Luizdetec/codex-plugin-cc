@@ -30,11 +30,15 @@ function send(socket, message) {
   if (socket.destroyed) {
     return;
   }
+  if (socket.writableLength > 8 * 1024 * 1024) {
+    socket.destroy();
+    return;
+  }
   socket.write(`${JSON.stringify(message)}\n`);
 }
 
 function isInterruptRequest(message) {
-  return message?.method === "turn/interrupt";
+  return message?.method === "turn/interrupt" || message?.method === "turn/steer";
 }
 
 function writePidFile(pidFile) {
@@ -65,11 +69,13 @@ async function main() {
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
   writePidFile(pidFile);
 
-  const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+  const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true, requestTimeoutMs: 10000 });
+  appClient.options.requestTimeoutMs = 30000;
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  let shutdownPromise = null;
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -78,6 +84,8 @@ async function main() {
     if (activeStreamSocket === socket) {
       activeStreamSocket = null;
       activeStreamThreadIds = null;
+      // Do not leave an unobserved turn running after its owning worker disappears.
+      shutdown(server).catch(() => {});
     }
   }
 
@@ -99,17 +107,23 @@ async function main() {
     }
   }
 
-  async function shutdown(server) {
+  function shutdown(server) {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = finishShutdown(server);
+    return shutdownPromise;
+  }
+
+  async function finishShutdown(server) {
     for (const socket of sockets) {
-      socket.end();
+      socket.destroy();
     }
     await appClient.close().catch(() => {});
     await new Promise((resolve) => server.close(resolve));
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
+    if (listenTarget.kind === "unix") {
+      fs.rmSync(listenTarget.path, { force: true });
     }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
+    if (pidFile) {
+      fs.rmSync(pidFile, { force: true });
     }
   }
 
@@ -119,9 +133,12 @@ async function main() {
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
+    let queue = Promise.resolve();
+    let queuedSize = 0;
 
-    socket.on("data", async (chunk) => {
+    async function processChunk(chunk) {
       buffer += chunk;
+      if (buffer.length > 8 * 1024 * 1024) throw new Error("Broker frame limit exceeded.");
       let newlineIndex = buffer.indexOf("\n");
       while (newlineIndex !== -1) {
         const line = buffer.slice(0, newlineIndex);
@@ -196,12 +213,15 @@ async function main() {
 
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
+        if (isStreaming) {
+          activeStreamSocket = socket;
+          activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, null);
+        }
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
-          if (isStreaming) {
-            activeStreamSocket = socket;
+          if (isStreaming && activeStreamSocket === socket) {
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
           }
           if (activeRequestSocket === socket) {
@@ -215,11 +235,23 @@ async function main() {
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
-          if (activeStreamSocket === socket && !isStreaming) {
+          if (activeStreamSocket === socket && isStreaming) {
             activeStreamSocket = null;
+            activeStreamThreadIds = null;
           }
         }
       }
+    }
+
+    socket.on("data", (chunk) => {
+      queuedSize += chunk.length;
+      if (queuedSize + buffer.length > 8 * 1024 * 1024) {
+        socket.destroy();
+        return;
+      }
+      queue = queue.then(() => socket.destroyed ? undefined : processChunk(chunk))
+        .catch(() => socket.destroy())
+        .finally(() => { queuedSize -= chunk.length; });
     });
 
     socket.on("close", () => {
@@ -242,6 +274,10 @@ async function main() {
     await shutdown(server);
     process.exit(0);
   });
+
+  // A dead upstream must close subscribers instead of leaving captureTurn pending.
+  appClient.exitPromise.then(() => shutdown(server)).catch(() => {}).finally(() => process.exit(0));
+  server.on("error", () => { shutdown(server).finally(() => process.exit(1)); });
 
   server.listen(listenTarget.path);
 }
