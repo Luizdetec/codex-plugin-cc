@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { resolveJobLogFile, resolveJobFile, readJobFile, updateJob, isActiveJob } from "./state.mjs";
+
+import { appendBoundedLog } from "./storage.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -38,14 +40,14 @@ export function appendLogLine(logFile, message) {
   if (!logFile || !normalized) {
     return;
   }
-  fs.appendFileSync(logFile, `[${nowIso()}] ${normalized}\n`, "utf8");
+  appendBoundedLog(logFile, `[${nowIso()}] ${normalized}\n`);
 }
 
 export function appendLogBlock(logFile, title, body) {
   if (!logFile || !body) {
     return;
   }
-  fs.appendFileSync(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`, "utf8");
+  appendBoundedLog(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`);
 }
 
 export function createJobLogFile(workspaceRoot, jobId, title) {
@@ -99,18 +101,7 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
-
-    const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
-      return;
-    }
-
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
-    });
+    updateJob(workspaceRoot, jobId, existing => existing.id ? patch : null);
   };
 }
 
@@ -131,74 +122,69 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
   };
 }
 
-function readStoredJobOrNull(workspaceRoot, jobId) {
-  const jobFile = resolveJobFile(workspaceRoot, jobId);
-  if (!fs.existsSync(jobFile)) {
-    return null;
-  }
-  return readJobFile(jobFile);
-}
-
 export async function runTrackedJob(job, runner, options = {}) {
-  const runningRecord = {
-    ...job,
-    status: "running",
-    startedAt: nowIso(),
-    phase: "starting",
-    pid: process.pid,
-    logFile: options.logFile ?? job.logFile ?? null
-  };
-  writeJobFile(job.workspaceRoot, job.id, runningRecord);
-  upsertJob(job.workspaceRoot, runningRecord);
-
+  const controller = new AbortController();
+  const cancel = () => controller.abort(new Error("Cancelled by user."));
+  process.once("SIGTERM", cancel);
+  process.once("SIGINT", cancel);
+  const jobFile = resolveJobFile(job.workspaceRoot, job.id);
+  const cancelTimer = setInterval(() => {
+    try { if (readJobFile(jobFile).cancelSignalAt) cancel(); } catch { /* A concurrent session cleanup may remove the file. */ }
+  }, 100);
+  cancelTimer.unref();
   try {
-    const execution = await runner();
-    const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
-    const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...runningRecord,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      pid: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      completedAt,
-      result: execution.payload,
-      rendered: execution.rendered
+    const runningRecord = updateJob(job.workspaceRoot, job.id, existing => {
+      if (options.requireExisting && !existing.id) return null;
+      if (existing.cancelRequestedAt) return null;
+      return {
+        ...job,
+        status: "running",
+        startedAt: nowIso(),
+        phase: "starting",
+        pid: process.pid,
+        managedWorker: true,
+        logFile: options.logFile ?? job.logFile ?? null
+      };
     });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      pid: null,
-      completedAt
+    if (!isActiveJob(runningRecord) || runningRecord.cancelRequestedAt) {
+      throw new Error("Task was cancelled before execution.");
+    }
+    // The launcher only acknowledges a worker after its running state is durable.
+    if (process.send) process.send({ type: "ready", jobId: job.id });
+    if (process.connected) process.disconnect();
+    const execution = await runner(controller.signal);
+    const record = updateJob(job.workspaceRoot, job.id, existing => {
+      const status = existing.cancelRequestedAt || controller.signal.aborted
+        ? "cancelled" : execution.exitStatus === 0 ? "completed" : "failed";
+      return {
+        status,
+        threadId: execution.threadId ?? existing.threadId ?? null,
+        turnId: execution.turnId ?? existing.turnId ?? null,
+        summary: execution.summary,
+        pid: null,
+        phase: status === "completed" ? "done" : status,
+        completedAt: nowIso(),
+        result: execution.payload,
+        rendered: execution.rendered,
+        errorMessage: status === "cancelled" ? "Cancelled by user." : execution.payload?.error?.message ?? null
+      };
     });
-    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    appendLogBlock(options.logFile ?? job.logFile, "Final output", execution.rendered);
+    if (record.status === "cancelled") return { ...execution, exitStatus: 1 };
     return execution;
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
-    const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...existing,
-      status: "failed",
-      phase: "failed",
-      errorMessage,
+    updateJob(job.workspaceRoot, job.id, existing => options.requireExisting && !existing.id ? null : ({
+      status: existing.cancelRequestedAt || controller.signal.aborted ? "cancelled" : "failed",
+      phase: existing.cancelRequestedAt || controller.signal.aborted ? "cancelled" : "failed",
       pid: null,
-      completedAt,
-      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
-    });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: "failed",
-      phase: "failed",
-      pid: null,
-      errorMessage,
-      completedAt
-    });
+      errorMessage: existing.cancelRequestedAt || controller.signal.aborted ? "Cancelled by user." : String(error?.message ?? error),
+      completedAt: nowIso()
+    }));
     throw error;
+  } finally {
+    clearInterval(cancelTimer);
+    if (process.connected) process.disconnect();
+    process.removeListener("SIGTERM", cancel);
+    process.removeListener("SIGINT", cancel);
   }
 }

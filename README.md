@@ -5,8 +5,6 @@ Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
 they already have.
 
-<video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
-
 This is an independent VanguardIA fork of OpenAI's plugin, not an official OpenAI release. License and upstream notices are preserved.
 Do not enable this and the official `codex` plugin together: both intentionally preserve the `/codex:` command namespace. No global configuration changes are required.
 
@@ -26,6 +24,7 @@ Explicit continuation resumes the current Claude session's last task without a r
 Failures remain visible. No silent model fallback or replay of a possibly accepted task occurs.
 
 One active write task per checkout is enforced across sessions. Use separate worktrees for parallel edits.
+Cancellation waits for the worker to exit and release its write lock, including during initialization.
 After abrupt termination a write lock may remain: verify the task and its Codex processes have exited before removing the exact lock reported by the error.
 Steering requires a running job in the same Claude session and its live broker.
 The broker handles one active task at a time; a busy response is an explicit failure, not a hidden second execution.
@@ -294,12 +293,18 @@ The Codex plugin wraps the [Codex app server](https://developers.openai.com/code
 
 ### Common Configurations
 
-If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-5.4-mini` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
+Delegated tasks (`delegate` and `rescue`) use this precedence:
 
-```toml
-model = "gpt-5.4-mini"
-model_reasoning_effort = "high"
-```
+| Setting | Selection |
+| --- | --- |
+| Model | Explicit `--model`, otherwise `gpt-6-astra` |
+| Reasoning effort | Explicit `--effort`, otherwise the selected model's advertised default |
+| Other Codex configuration | Your normal user/project configuration, subject to the plugin's read-only or workspace-write sandbox and noninteractive approval policy |
+
+The delegated model and effort are passed explicitly to Codex, so `model` and
+`model_reasoning_effort` in `config.toml` do not change these delegation defaults.
+Use `/codex:models` to inspect the catalog, then pass the desired flags.
+Native reviews keep Codex's normal review configuration; their default is not forced to Astra.
 
 Your configuration will be picked up based on:
 
@@ -342,3 +347,50 @@ Yes. If you already use Codex, the plugin picks up the same [configuration](#com
 Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
 
 If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
+
+## Execution and recovery
+
+| Command | How background execution works |
+| --- | --- |
+| `/codex:delegate`, `/codex:rescue` | `task --background` saves the request and waits for the detached worker's startup acknowledgement. The receipt confirms launch, not completion. |
+| `/codex:review`, `/codex:adversarial-review` | Claude runs Bash in the background. Passing `--background` to the review script alone does not detach it. |
+
+`status` reconciles jobs whose worker exited without recording a final result.
+It never automatically retries a task. Terminal states cannot be overwritten by late progress.
+A final assistant message without `turn/completed` remains unconfirmed; after ten seconds
+without the terminal event once known subagent work has drained, the job fails explicitly.
+Inspect its Codex thread before deciding whether to resume it.
+
+`result --json` returns the stored job status and structured error. The result command's
+exit code describes the lookup; inspect `job.status` to determine whether the task succeeded.
+Text results identify failed/cancelled tasks and label any partial output.
+A failed authentication lookup is reported as unknown, not as a logout. Read-only setup
+checks may use a fresh connection when a shared broker is stale or busy.
+
+State updates use a short per-workspace lock and atomic file replacement. If a process is
+forcibly terminated inside a state update, an error reports the exact `state.lock` path.
+Verify that its recorded owner has exited before removing that exact stale lock.
+Finished-job retention keeps the latest 50 entries and preserves all active jobs.
+Each job log keeps a current file and one rotated file of up to 1 MiB each; the complete
+stored final result is separate. Progress previews read at most the last 64 KiB.
+
+## Development and validation
+
+```bash
+npm ci
+npm run check-version
+npm test
+npm run build
+claude --plugin-dir ./plugins/codex
+```
+
+Tests use a fake Codex server and real local child processes; they do not invoke a paid model.
+The build type-checks all runtime entrypoints and generates protocol types from the installed Codex CLI.
+The CI compatibility baseline is Codex `0.154.0`; a separate advisory job checks the latest CLI.
+The matrix covers Node 18.18, 22 and 24 on Linux, plus Node 22 on macOS and Windows.
+Use a current supported Node release for normal development; Node 18.18 is the minimum compatibility target.
+
+For a real integration smoke test in a disposable workspace, start a read-only background task,
+check `status`, send `steer`, cancel it, resume the same thread with a short instruction, and read
+`result`. Verify the returned thread ID and terminal status. Load the local plugin with
+`--plugin-dir` for that session; do not enable the official plugin alongside this fork.

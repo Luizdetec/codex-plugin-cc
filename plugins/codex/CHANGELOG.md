@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0-astra.2 — Runtime reliability
+
+- Serialize state updates, preserve active jobs, atomically replace JSON and prevent terminal-state regressions.
+- Persist background requests before spawning workers and acknowledge startup over IPC.
+- Cancel cooperatively during initialization and active turns; retain cancellation state and release write locks.
+- Require terminal completion, preserve turn errors and recover read-only setup checks from stale or busy brokers.
+- Bound progress reads, log retention and stderr; reuse availability checks and small diffs.
+- Type-check every runtime script and add cross-platform, version-pinned CI plus an advisory latest-Codex check.
+
 ## 1.1.0-astra.1 — VanguardIA fork
 
 - Default delegated tasks to Astra; discover models and reasoning efforts from Codex instead of a fixed catalog.

@@ -4,6 +4,7 @@ import { getSessionRuntimeStatus } from "./codex.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
+import { readFileTail } from "./storage.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
@@ -63,8 +64,7 @@ export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_
     return [];
   }
 
-  const lines = fs
-    .readFileSync(logFile, "utf8")
+  const lines = readFileTail(logFile)
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
     .filter(Boolean)

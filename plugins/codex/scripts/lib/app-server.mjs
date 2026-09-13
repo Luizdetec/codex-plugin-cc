@@ -67,6 +67,10 @@ class AppServerClientBase {
     this.notificationHandler = null;
     this.lineBuffer = "";
     this.transport = "unknown";
+    this.onAbort = () => {};
+    this.streamThreadId = null;
+    /** @type {Promise<void> | null} */
+    this.closePromise = null;
 
     this.exitPromise = new Promise((resolve) => {
       this.resolveExit = resolve;
@@ -84,7 +88,7 @@ class AppServerClientBase {
    * @returns {Promise<import("./app-server-protocol").AppServerResponse<M>>}
    */
   request(method, params) {
-    if (this.closed) {
+    if (this.closed || this.exitResolved) {
       throw new Error("codex app-server client is closed.");
     }
 
@@ -96,8 +100,9 @@ class AppServerClientBase {
         this.pending.delete(id);
         reject(new Error(`codex app-server ${method} timed out.`));
       }, this.options.requestTimeoutMs ?? 30000);
-      this.pending.set(id, { resolve, reject, method, timer });
+      this.pending.set(id, { resolve, reject, method, timer, completedThreadIds: new Set() });
       try {
+        if ((method === "turn/start" || method === "review/start") && "threadId" in params) this.streamThreadId = params.threadId;
         this.sendMessage({ id, method, params });
       } catch (error) {
         clearTimeout(timer);
@@ -152,13 +157,27 @@ class AppServerClientBase {
       clearTimeout(pending.timer);
 
       if (message.error) {
+        if (pending.method === "turn/start" || pending.method === "review/start") this.streamThreadId = null;
         pending.reject(createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error));
       } else {
+        if (pending.method === "review/start" && message.result?.reviewThreadId) {
+          const threadId = message.result.reviewThreadId;
+          this.streamThreadId = pending.completedThreadIds.has(threadId) ? null : threadId;
+        }
         pending.resolve(message.result ?? {});
       }
       return;
     }
 
+    if (message.method === "turn/completed") {
+      const threadId = message.params?.threadId;
+      // The broker can forward completion before the start response is relayed.
+      // Remember it until the response identifies the detached review thread.
+      for (const pending of this.pending.values()) {
+        if (pending.method === "review/start") pending.completedThreadIds.add(threadId);
+      }
+      if (threadId === this.streamThreadId) this.streamThreadId = null;
+    }
     if (message.method && this.notificationHandler) {
       this.notificationHandler(/** @type {AppServerNotification} */ (message));
     }
@@ -212,7 +231,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.proc.stderr.setEncoding("utf8");
 
     this.proc.stderr.on("data", (chunk) => {
-      this.stderr += chunk;
+      this.stderr = (this.stderr + chunk).slice(-64 * 1024);
     });
 
     this.proc.on("error", (error) => {
@@ -242,7 +261,13 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.notify("initialized", {});
   }
 
-  async close() {
+  close() {
+    this.closePromise ??= this.finishClose();
+    return this.closePromise;
+  }
+
+  async finishClose() {
+    this.options.signal?.removeEventListener("abort", this.onAbort);
     if (this.closed) {
       await this.exitPromise;
       return;
@@ -305,6 +330,8 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     super(cwd, options);
     this.transport = "broker";
     this.endpoint = options.brokerEndpoint;
+    const session = loadBrokerSession(cwd);
+    this.brokerPid = session?.endpoint === this.endpoint ? session.pid : null;
   }
 
   async initialize() {
@@ -334,7 +361,13 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     this.notify("initialized", {});
   }
 
-  async close() {
+  close() {
+    this.closePromise ??= this.finishClose();
+    return this.closePromise;
+  }
+
+  async finishClose() {
+    this.options.signal?.removeEventListener("abort", this.onAbort);
     if (this.closed) {
       await this.exitPromise;
       return;
@@ -345,6 +378,16 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
       this.socket.destroy();
     }
     await this.exitPromise;
+    // Losing an active stream closes its broker. Do not release a workspace lock
+    // until that broker has finished terminating its upstream Codex process.
+    if (this.streamThreadId && this.brokerPid) {
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        try { process.kill(this.brokerPid, 0); } catch (error) { if (error.code === "ESRCH") return; throw error; }
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      throw Object.assign(new Error(`Codex broker ${this.brokerPid} has not exited; the workspace write lock was preserved.`), { preserveWriteLock: true });
+    }
   }
 
   sendMessage(message) {
@@ -359,6 +402,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
 
 export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
+    options.signal?.throwIfAborted();
     let brokerEndpoint = null;
     if (!options.disableBroker) {
       brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
@@ -370,11 +414,15 @@ export class CodexAppServerClient {
         brokerEndpoint = brokerSession?.endpoint ?? null;
       }
     }
+    options.signal?.throwIfAborted();
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
+    client.onAbort = () => { void client.close().catch(() => {}); };
     try {
+      options.signal?.addEventListener("abort", client.onAbort, { once: true });
       await client.initialize();
+      options.signal?.throwIfAborted();
     } catch (error) {
       await client.close().catch(() => {});
       throw error;

@@ -250,7 +250,7 @@ async function main() {
         return;
       }
       queue = queue.then(() => socket.destroyed ? undefined : processChunk(chunk))
-        .catch(() => socket.destroy())
+        .catch(() => { socket.destroy(); })
         .finally(() => { queuedSize -= chunk.length; });
     });
 

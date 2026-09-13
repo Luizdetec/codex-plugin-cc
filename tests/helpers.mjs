@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { after } from "node:test";
 import { loadBrokerSession, sendBrokerShutdown } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 
@@ -47,4 +47,22 @@ export function initGitRepo(cwd) {
   run("git", ["config", "user.email", "tests@example.com"], { cwd });
   run("git", ["config", "commit.gpgsign", "false"], { cwd });
   run("git", ["config", "tag.gpgsign", "false"], { cwd });
+}
+
+// Keep the test event loop free to reap its own children while cancellation waits for exit.
+export function runAsync(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd, env: options.env,
+      shell: process.platform === "win32" && !path.isAbsolute(command),
+      windowsHide: true, stdio: ["pipe", "pipe", "pipe"]
+    });
+    let stdout = "", stderr = "";
+    const timer = setTimeout(() => { child.kill(); reject(new Error("Test command timed out")); }, options.timeout ?? 30000);
+    child.stdout.on("data", chunk => { stdout += chunk; });
+    child.stderr.on("data", chunk => { stderr += chunk; });
+    child.once("error", error => { clearTimeout(timer); reject(error); });
+    child.once("close", (status, signal) => { clearTimeout(timer); resolve({ status, signal, stdout, stderr }); });
+    child.stdin.end(options.input ?? "");
+  });
 }

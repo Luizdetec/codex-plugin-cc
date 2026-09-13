@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { resolveStateDir } from "./state.mjs";
 import { terminateProcessTree } from "./process.mjs";
+import { writeJsonAtomic, readFileTail } from "./storage.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
@@ -92,7 +93,7 @@ export function loadBrokerSession(cwd) {
 export function saveBrokerSession(cwd, session) {
   const stateDir = resolveStateDir(cwd);
   fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  writeJsonAtomic(resolveBrokerStateFile(cwd), session);
 }
 
 export function clearBrokerSession(cwd) {
@@ -170,6 +171,7 @@ async function startOrReuseBroker(cwd, options = {}) {
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 12000);
   if (!ready) {
+    const startupError = readFileTail(logFile, 8192).trim();
     // The child was spawned detached by this call, so its process group is ours.
     if (process.platform !== "win32") {
       try { process.kill(-child.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
@@ -184,7 +186,7 @@ async function startOrReuseBroker(cwd, options = {}) {
       pid: child.pid ?? null,
       killProcess: options.killProcess ?? null
     });
-    throw new Error("Codex broker did not become ready. Check the installed Codex runtime and retry.");
+    throw new Error(`Codex broker did not become ready. Check the installed Codex runtime and retry.${startupError ? `\n${startupError}` : ""}`);
   }
 
   const session = {

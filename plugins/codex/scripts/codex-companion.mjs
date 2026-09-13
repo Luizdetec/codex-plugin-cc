@@ -35,8 +35,8 @@ import {
   getConfig,
   listJobs,
   setConfig,
-  upsertJob,
-  writeJobFile
+  updateJob,
+  isActiveJob
 } from "./lib/state.mjs";
 import {
   buildSingleJobSnapshot,
@@ -188,7 +188,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   }
 
   return {
-    ready: nodeStatus.available && codexStatus.available && authStatus.loggedIn,
+    ready: nodeStatus.available && codexStatus.available && authStatus.loggedIn === true,
     node: nodeStatus,
     npm: npmStatus,
     codex: codexStatus,
@@ -358,7 +358,8 @@ async function executeReviewRun(request) {
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
-      onProgress: request.onProgress
+      onProgress: request.onProgress,
+      signal: request.signal
     });
     const payload = {
       review: reviewName,
@@ -401,7 +402,8 @@ async function executeReviewRun(request) {
     model: request.model,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress
+    onProgress: request.onProgress,
+    signal: request.signal
   });
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
@@ -480,6 +482,7 @@ async function executeTaskRun(request) {
     sandbox: request.write ? "workspace-write" : "read-only",
     onProgress: request.onProgress,
     persistThread: true,
+    signal: request.signal,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
   }));
 
@@ -488,6 +491,7 @@ async function executeTaskRun(request) {
   const rendered = renderTaskResult(
     {
       rawOutput,
+      status: result.status,
       failureMessage,
       reasoningSummary: result.reasoningSummary
     },
@@ -504,7 +508,8 @@ async function executeTaskRun(request) {
     effort: result.effort,
     rawOutput,
     touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    error: result.error ?? null
   };
 
   return {
@@ -651,7 +656,7 @@ async function runForegroundCommand(job, runner, options = {}) {
     logFile: options.logFile,
     stderr: !options.json
   });
-  const execution = await runTrackedJob(job, () => runner(progress), { logFile });
+  const execution = await runTrackedJob(job, (signal) => runner(progress, signal), { logFile });
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
@@ -665,28 +670,55 @@ function spawnDetachedTaskWorker(cwd, jobId) {
     cwd,
     env: process.env,
     detached: true,
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "ignore", "ipc"],
     windowsHide: true
   });
   child.unref();
   return child;
 }
 
-function enqueueBackgroundTask(cwd, job, request) {
+async function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
+    launcherPid: process.pid,
+    managedWorker: true,
     logFile,
     request
   };
-  writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
+  updateJob(job.workspaceRoot, job.id, queuedRecord);
+  let child;
+  try {
+    child = spawnDetachedTaskWorker(cwd, job.id);
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => finish(new Error("Background worker did not acknowledge startup.")), 10000);
+      const onMessage = message => {
+        if (message?.type === "ready" && message.jobId === job.id) finish();
+      };
+      const onExit = (code, signal) => finish(new Error(`Background worker exited before startup (${signal ?? code}).`));
+      const onError = error => finish(error);
+      function finish(error = null) {
+        clearTimeout(timer);
+        child.removeListener("message", onMessage);
+        child.removeListener("exit", onExit);
+        child.removeListener("error", onError);
+        if (child.connected) child.disconnect();
+        if (error) reject(error); else resolve(undefined);
+      }
+      child.on("message", onMessage);
+      child.once("exit", onExit);
+      child.once("error", onError);
+    });
+  } catch (error) {
+    if (child?.pid) terminateProcessTree(child.pid);
+    updateJob(job.workspaceRoot, job.id, { status: "failed", phase: "failed", pid: null, completedAt: nowIso(), errorMessage: error.message });
+    throw error;
+  }
 
   return {
     payload: {
@@ -729,7 +761,7 @@ async function handleReviewCommand(argv, config) {
   });
   await runForegroundCommand(
     job,
-    (progress) =>
+    (progress, signal) =>
       executeReviewRun({
         cwd,
         base: options.base,
@@ -737,7 +769,8 @@ async function handleReviewCommand(argv, config) {
         model: options.model,
         focusText,
         reviewName: config.reviewName,
-        onProgress: progress
+        onProgress: progress,
+        signal
       }),
     { json: options.json }
   );
@@ -791,7 +824,7 @@ async function handleTask(argv) {
       resumeLast,
       jobId: job.id
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    const { payload } = await enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
@@ -799,7 +832,7 @@ async function handleTask(argv) {
   const job = buildTaskJob(workspaceRoot, taskMetadata, write);
   await runForegroundCommand(
     job,
-    (progress) =>
+    (progress, signal) =>
       executeTaskRun({
         cwd,
         model,
@@ -808,7 +841,8 @@ async function handleTask(argv) {
         write,
         resumeLast,
         jobId: job.id,
-        onProgress: progress
+        onProgress: progress,
+        signal
       }),
     { json: options.json }
   );
@@ -863,12 +897,13 @@ async function handleTaskWorker(argv) {
       workspaceRoot,
       logFile
     },
-    () =>
+    (signal) =>
       executeTaskRun({
         ...request,
+        signal,
         onProgress: progress
       }),
-    { logFile }
+    { logFile, requireExisting: true }
   );
 }
 
@@ -979,7 +1014,11 @@ async function handleCancel(argv) {
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
-  const existing = readStoredJob(workspaceRoot, job.id) ?? {};
+  const existing = updateJob(workspaceRoot, job.id, { cancelRequestedAt: nowIso() });
+  if (!isActiveJob(existing)) {
+    outputCommandResult({ jobId: job.id, status: existing.status }, `Job ${job.id} already ${existing.status}.\n`, options.json);
+    return;
+  }
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
 
@@ -994,14 +1033,21 @@ async function handleCancel(argv) {
   }
 
   // Let the interrupted worker persist its result and release its write lock first.
-  if (interrupt.interrupted && job.pid) {
-    const deadline = Date.now() + 2000;
+  // SIGTERM is cooperative for tracked workers, including initialization before turn/start.
+  updateJob(workspaceRoot, job.id, { cancelSignalAt: nowIso() });
+  if (process.platform !== "win32" || !existing.managedWorker) terminateProcessTree(existing.pid ?? job.pid ?? Number.NaN);
+  if (existing.pid ?? job.pid) {
+    const pid = existing.pid ?? job.pid;
+    const deadline = Date.now() + 15000;
     while (Date.now() < deadline) {
-      try { process.kill(job.pid, 0); } catch { break; }
+      try { process.kill(pid, 0); } catch { break; }
       await new Promise(resolve => setTimeout(resolve, 25));
     }
+    try {
+      process.kill(pid, 0);
+      throw new Error(`Cancellation requested, but process ${pid} has not exited. The write lock was preserved.`);
+    } catch (error) { if (error.code !== "ESRCH") throw error; }
   }
-  terminateProcessTree(job.pid ?? Number.NaN);
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();
@@ -1014,18 +1060,10 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  writeJobFile(workspaceRoot, job.id, {
+  updateJob(workspaceRoot, job.id, {
     ...existing,
     ...nextJob,
     cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
   });
 
   const payload = {
