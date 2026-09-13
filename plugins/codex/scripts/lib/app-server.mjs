@@ -100,7 +100,7 @@ class AppServerClientBase {
         this.pending.delete(id);
         reject(new Error(`codex app-server ${method} timed out.`));
       }, this.options.requestTimeoutMs ?? 30000);
-      this.pending.set(id, { resolve, reject, method, timer });
+      this.pending.set(id, { resolve, reject, method, timer, completedThreadIds: new Set() });
       try {
         if ((method === "turn/start" || method === "review/start") && "threadId" in params) this.streamThreadId = params.threadId;
         this.sendMessage({ id, method, params });
@@ -160,13 +160,24 @@ class AppServerClientBase {
         if (pending.method === "turn/start" || pending.method === "review/start") this.streamThreadId = null;
         pending.reject(createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error));
       } else {
-        if (pending.method === "review/start" && message.result?.reviewThreadId) this.streamThreadId = message.result.reviewThreadId;
+        if (pending.method === "review/start" && message.result?.reviewThreadId) {
+          const threadId = message.result.reviewThreadId;
+          this.streamThreadId = pending.completedThreadIds.has(threadId) ? null : threadId;
+        }
         pending.resolve(message.result ?? {});
       }
       return;
     }
 
-    if (message.method === "turn/completed" && message.params?.threadId === this.streamThreadId) this.streamThreadId = null;
+    if (message.method === "turn/completed") {
+      const threadId = message.params?.threadId;
+      // The broker can forward completion before the start response is relayed.
+      // Remember it until the response identifies the detached review thread.
+      for (const pending of this.pending.values()) {
+        if (pending.method === "review/start") pending.completedThreadIds.add(threadId);
+      }
+      if (threadId === this.streamThreadId) this.streamThreadId = null;
+    }
     if (message.method && this.notificationHandler) {
       this.notificationHandler(/** @type {AppServerNotification} */ (message));
     }
