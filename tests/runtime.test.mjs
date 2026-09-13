@@ -323,7 +323,7 @@ test("transfer rejects sources outside the Claude projects directory", () => {
 
   const result = run("node", [SCRIPT, "transfer", "--source", sourcePath], {
     cwd: repo,
-    env: { ...buildEnv(binDir), HOME: home }
+    env: { ...buildEnv(binDir), HOME: home, USERPROFILE: home }
   });
 
   assert.notEqual(result.status, 0);
