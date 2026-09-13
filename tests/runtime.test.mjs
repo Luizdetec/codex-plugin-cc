@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { initGitRepo, makeTempDir, run, runAsync } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -131,7 +131,7 @@ test("setup reports not ready when app-server config read fails", () => {
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.ready, false);
-  assert.equal(payload.auth.loggedIn, false);
+  assert.equal(payload.auth.loggedIn, null);
   assert.equal(payload.auth.source, "app-server");
   assert.match(payload.auth.detail, /config\/read failed for cwd/);
 });
@@ -872,7 +872,7 @@ test("task ignores later subagent messages when choosing the final returned outp
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
-test("task can finish after subagent work even if the parent turn/completed event is missing", () => {
+test("task reports unconfirmed completion when the terminal event is missing", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "with-subagent-no-main-turn-completed");
@@ -886,8 +886,8 @@ test("task can finish after subagent work even if the parent turn/completed even
     env: buildEnv(binDir)
   });
 
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /Completion is unconfirmed/);
 });
 
 test("task using the shared broker still completes when Codex spawns subagents", () => {
@@ -1608,7 +1608,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
     "utf8"
   );
 
-  const cancelResult = run("node", [SCRIPT, "cancel", "task-live", "--json"], {
+  const cancelResult = await runAsync("node", [SCRIPT, "cancel", "task-live", "--json"], {
     cwd: workspace
   });
 
@@ -1887,7 +1887,7 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     "utf8"
   );
 
-  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+  const result = await runAsync("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
     env: {
       ...process.env,

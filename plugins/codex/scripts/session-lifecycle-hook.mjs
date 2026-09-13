@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { loadState, resolveStateFile, updateState, updateJob } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -39,7 +39,7 @@ function appendEnvVar(name, value) {
   fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
 }
 
-function cleanupSessionJobs(cwd, sessionId) {
+async function cleanupSessionJobs(cwd, sessionId) {
   if (!cwd || !sessionId) {
     return;
   }
@@ -62,15 +62,22 @@ function cleanupSessionJobs(cwd, sessionId) {
       continue;
     }
     try {
-      terminateProcessTree(job.pid ?? Number.NaN);
+      updateJob(workspaceRoot, job.id, { cancelRequestedAt: new Date().toISOString(), cancelSignalAt: new Date().toISOString() });
+      if (process.platform !== "win32" || !job.managedWorker) terminateProcessTree(job.pid ?? Number.NaN);
     } catch {
       // Ignore teardown failures during session shutdown.
     }
   }
-
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+  const pending = new Set(removedJobs.filter(job => job.pid).map(job => job.pid));
+  const deadline = Date.now() + 3000;
+  while (pending.size && Date.now() < deadline) {
+    for (const pid of pending) {
+      try { process.kill(pid, 0); } catch (error) { if (error.code === "ESRCH") pending.delete(pid); }
+    }
+    if (pending.size) await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  updateState(workspaceRoot, current => {
+    current.jobs = current.jobs.filter(job => job.sessionId !== sessionId || pending.has(job.pid));
   });
 }
 
@@ -87,7 +94,7 @@ async function handleSessionEnd(input) {
   const otherSessionActive = jobs.some(job => job.sessionId !== sessionId && (job.status === "queued" || job.status === "running"));
   if (otherSessionActive) {
     // The broker is shared by checkout, not owned by the session ending here.
-    cleanupSessionJobs(cwd, sessionId);
+    await cleanupSessionJobs(cwd, sessionId);
     return;
   }
   const brokerSession =
@@ -114,7 +121,7 @@ async function handleSessionEnd(input) {
     }
   }
 
-  cleanupSessionJobs(cwd, sessionId);
+  await cleanupSessionJobs(cwd, sessionId);
   teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,

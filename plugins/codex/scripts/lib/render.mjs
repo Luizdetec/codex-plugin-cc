@@ -314,6 +314,9 @@ export function renderNativeReviewResult(result, meta) {
 
 export function renderTaskResult(parsedResult, meta) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
+  if (parsedResult?.failureMessage && parsedResult.status !== 0) {
+    return `Codex task failed: ${parsedResult.failureMessage}\n${rawOutput ? `\nPartial output:\n${rawOutput.trimEnd()}\n` : ""}`;
+  }
   if (rawOutput) {
     return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
   }
@@ -390,6 +393,11 @@ export function renderJobStatusReport(job) {
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
+  if (job.status === "failed" || job.status === "cancelled") {
+    const error = storedJob?.errorMessage ?? job.errorMessage ?? storedJob?.result?.error?.message ?? "No additional error details were captured.";
+    const partial = storedJob?.result?.rawOutput ?? storedJob?.result?.codex?.stdout ?? "";
+    return `Codex task ${job.status}: ${error}\n${partial ? `\nPartial output:\n${partial.trimEnd()}\n` : ""}${resumeCommand ? `\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n` : ""}`;
+  }
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     if (!threadId) {

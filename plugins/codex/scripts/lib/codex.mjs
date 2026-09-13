@@ -51,6 +51,7 @@ const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
+const availabilityCache = new Map();
 
 function cleanCodexStderr(stderr) {
   return stderr
@@ -344,7 +345,7 @@ function clearCompletionTimer(state) {
   }
 }
 
-function completeTurn(state, turn = null, options = {}) {
+function completeTurn(state, turn) {
   if (state.completed) {
     return;
   }
@@ -357,21 +358,12 @@ function completeTurn(state, turn = null, options = {}) {
     if (!state.turnId) {
       state.turnId = turn.id;
     }
-  } else if (!state.finalTurn) {
-    state.finalTurn = {
-      id: state.turnId ?? "inferred-turn",
-      status: "completed"
-    };
-  }
-
-  if (options.inferred) {
-    emitProgress(state.onProgress, "Turn completion inferred after the main thread finished and subagent work drained.", "finalizing");
   }
 
   state.resolveCompletion(state);
 }
 
-function scheduleInferredCompletion(state) {
+function scheduleTerminalDeadline(state) {
   if (state.completed || state.finalTurn || !state.finalAnswerSeen) {
     return;
   }
@@ -389,8 +381,8 @@ function scheduleInferredCompletion(state) {
     if (state.pendingCollaborations.size > 0 || state.activeSubagentTurns.size > 0) {
       return;
     }
-    completeTurn(state, null, { inferred: true });
-  }, 250);
+    state.rejectCompletion(new Error("Codex returned a final message but no terminal turn/completed event. Completion is unconfirmed; inspect the thread before retrying."));
+  }, 10000);
   state.completionTimer.unref?.();
 }
 
@@ -411,7 +403,7 @@ function recordItem(state, item, lifecycle, threadId = null) {
         state.pendingCollaborations.add(item.id);
       } else if (lifecycle === "completed") {
         state.pendingCollaborations.delete(item.id);
-        scheduleInferredCompletion(state);
+        scheduleTerminalDeadline(state);
       }
     }
     for (const receiverThreadId of item.receiverThreadIds ?? []) {
@@ -430,7 +422,7 @@ function recordItem(state, item, lifecycle, threadId = null) {
         state.lastAgentMessage = item.text;
         if (lifecycle === "completed" && item.phase === "final_answer") {
           state.finalAnswerSeen = true;
-          scheduleInferredCompletion(state);
+          scheduleTerminalDeadline(state);
         }
       }
       if (lifecycle === "completed") {
@@ -542,7 +534,7 @@ function applyTurnNotification(state, message) {
     case "turn/completed":
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.delete(message.params.threadId);
-        scheduleInferredCompletion(state);
+        scheduleTerminalDeadline(state);
         break;
       }
       emitProgress(
@@ -551,6 +543,7 @@ function applyTurnNotification(state, message) {
         "finalizing"
       );
       completeTurn(state, message.params.turn);
+      state.error = message.params.turn.error ?? (message.params.turn.status === "completed" ? null : state.error);
       break;
     default:
       break;
@@ -615,8 +608,8 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   }
 }
 
-async function withAppServer(cwd, fn) {
-  const client = await CodexAppServerClient.connect(cwd);
+async function withAppServer(cwd, fn, options = {}) {
+  const client = await CodexAppServerClient.connect(cwd, options);
   try {
     return await fn(client);
   } finally {
@@ -850,7 +843,6 @@ function buildAppServerAuthStatus(accountResponse, configResponse) {
 }
 
 async function getCodexAuthStatusFromClient(client, cwd) {
-  try {
     const accountResponse = await client.request("account/read", { refreshToken: false });
     const configResponse = await client.request("config/read", {
       includeLayers: false,
@@ -858,16 +850,12 @@ async function getCodexAuthStatusFromClient(client, cwd) {
     });
 
     return buildAppServerAuthStatus(accountResponse, configResponse);
-  } catch (error) {
-    return buildAuthStatus({
-      loggedIn: false,
-      detail: error instanceof Error ? error.message : String(error),
-      source: "app-server"
-    });
-  }
 }
 
 export function getCodexAvailability(cwd) {
+  const key = JSON.stringify([cwd, process.env.PATH]);
+  const cached = availabilityCache.get(key);
+  if (cached && Date.now() - cached.time < 5000) return cached.status;
   const versionStatus = binaryAvailable("codex", ["--version"], { cwd });
   if (!versionStatus.available) {
     return versionStatus;
@@ -881,10 +869,12 @@ export function getCodexAvailability(cwd) {
     };
   }
 
-  return {
+  const status = {
     available: true,
     detail: `${versionStatus.detail}; advanced runtime available`
   };
+  availabilityCache.set(key, { time: Date.now(), status });
+  return status;
 }
 
 export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
@@ -929,8 +919,17 @@ export async function getCodexAuthStatus(cwd, options = {}) {
     });
     return await getCodexAuthStatusFromClient(client, cwd);
   } catch (error) {
+    // Only a read-only diagnosis may use a fresh transport after a stale/busy broker.
+    if (["ENOENT", "ECONNREFUSED"].includes(error.code) || error.rpcCode === -32001) {
+      await client?.close().catch(() => {});
+      client = null;
+      try {
+        client = await CodexAppServerClient.connect(cwd, { env: options.env, disableBroker: true });
+        return await getCodexAuthStatusFromClient(client, cwd);
+      } catch (directError) { error = directError; }
+    }
     return buildAuthStatus({
-      loggedIn: false,
+      loggedIn: null,
       detail: error instanceof Error ? error.message : String(error),
       source: "app-server"
     });
@@ -1049,10 +1048,10 @@ export async function runAppServerReview(cwd, options = {}) {
       reviewText: turnState.reviewText,
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
-      error: turnState.error,
+      error: turnState.finalTurn?.error ?? turnState.error,
       stderr: cleanCodexStderr(client.stderr)
     };
-  });
+  }, { signal: options.signal });
 }
 
 export async function importExternalAgentSession(cwd, options = {}) {
@@ -1154,7 +1153,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       finalMessage: turnState.lastAgentMessage,
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
-      error: turnState.error,
+      error: turnState.finalTurn?.error ?? turnState.error,
       stderr: cleanCodexStderr(client.stderr),
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
@@ -1162,7 +1161,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       effort: selection.effort,
       commandExecutions: turnState.commandExecutions
     };
-  });
+  }, { signal: options.signal });
 }
 
 export async function findLatestTaskThread(cwd) {

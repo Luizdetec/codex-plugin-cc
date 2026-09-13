@@ -100,20 +100,15 @@ export function terminateProcessTree(pid, options = {}) {
   try {
     killImpl(-pid, "SIGTERM");
     return { attempted: true, delivered: true, method: "process-group" };
-  } catch (error) {
-    if (error?.code !== "ESRCH") {
-      try {
-        killImpl(pid, "SIGTERM");
-        return { attempted: true, delivered: true, method: "process" };
-      } catch (innerError) {
-        if (innerError?.code === "ESRCH") {
-          return { attempted: true, delivered: false, method: "process" };
-        }
-        throw innerError;
-      }
+  } catch {
+    // A foreground worker may not own a process group. Fall back to its PID.
+    try {
+      killImpl(pid, "SIGTERM");
+      return { attempted: true, delivered: true, method: "process" };
+    } catch (error) {
+      if (error?.code === "ESRCH") return { attempted: true, delivered: false, method: "process" };
+      throw error;
     }
-
-    return { attempted: true, delivered: false, method: "process-group" };
   }
 }
 
