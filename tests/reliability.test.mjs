@@ -67,7 +67,7 @@ test('concurrent state updates preserve both jobs and payloads', async () => {
 
 test('background launch survives a descheduled launcher', async () => {
   const f = fixture();
-  const preload = fileURLToPath(new URL('./fixtures/launch-delay.mjs', import.meta.url));
+  const preload = new URL('./fixtures/launch-delay.mjs', import.meta.url).href;
   try {
     const result = runNode(['--import', preload, script, 'task', '--background', '--json', 'inspect'], { cwd: f.repo, env: f.env });
     assert.equal(result.status, 0, result.stderr);
